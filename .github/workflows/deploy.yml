@@ -1,0 +1,77 @@
+name: Deploy Lambda Service
+run-name: Deploy ${{ vars.SERVICE_ALIAS }} to ${{ inputs.environment }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment Environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  SERVICE_ALIAS: ${{ vars.SERVICE_ALIAS }}
+  S3_STATE_BUCKET_NAME: ${{ vars.S3_STATE_BUCKET_NAME }}
+  DYNAMODB_LOCK_TABLE: ${{ vars.DYNAMODB_LOCK_TABLE }}
+  TERRAFORM_DIR: "./terraform"
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm ci --if-present
+
+      - name: Zip Application
+        run: |
+          zip -r function.zip . -x "*.git*" -x "terraform/*" -x ".github/*"
+          echo "ZIP_PATH=$(pwd)/function.zip" >> $GITHUB_ENV
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          TERRAFORM_KEY="${{ env.SERVICE_ALIAS }}/${{ inputs.environment }}/terraform.tfstate"
+          terraform init \
+            -backend-config="bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -backend-config="dynamodb_table=${{ env.DYNAMODB_LOCK_TABLE }}" \
+            -backend-config="key=$TERRAFORM_KEY"
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="environment=${{ inputs.environment }}" \
+            -var="service_name=${{ env.SERVICE_ALIAS }}" \
+            -var="platform_state_bucket=${{ env.S3_STATE_BUCKET_NAME }}" \
+            -var="lambda_zip_path=${{ env.ZIP_PATH }}"
+        working-directory: ${{ env.TERRAFORM_DIR }}
